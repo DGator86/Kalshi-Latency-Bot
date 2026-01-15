@@ -22,7 +22,29 @@ import asyncio
 import logging
 import hashlib
 import hmac
+import base64
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+# Load environment variables from .env file if it exists
+def load_dotenv():
+    """Simple .env file loader"""
+    env_paths = [
+        Path(__file__).parent / '.env',
+        Path.cwd() / '.env',
+        Path('/opt/kalshi-latency-bot/.env'),
+    ]
+    for env_path in env_paths:
+        if env_path.exists():
+            with open(env_path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        os.environ.setdefault(key.strip(), value.strip())
+            break
+
+load_dotenv()
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Callable
 from enum import Enum
@@ -37,9 +59,12 @@ try:
     import websockets
     import numpy as np
     from scipy.stats import norm
+    from cryptography.hazmat.primitives import serialization, hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    from cryptography.hazmat.backends import default_backend
 except ImportError as e:
     print(f"Missing dependency: {e}")
-    print("Install with: pip install aiohttp websockets numpy scipy")
+    print("Install with: pip install aiohttp websockets numpy scipy cryptography")
     sys.exit(1)
 
 # =============================================================================
@@ -51,10 +76,13 @@ class Config:
     """Bot configuration - modify these for your setup"""
 
     # Kalshi API credentials (set via environment variables)
+    # API Key ID from Kalshi
     KALSHI_API_KEY: str = field(default_factory=lambda: os.getenv("KALSHI_API_KEY", ""))
-    KALSHI_API_SECRET: str = field(default_factory=lambda: os.getenv("KALSHI_API_SECRET", ""))
-    KALSHI_API_BASE: str = "https://api.elections.kalshi.com/trade-api/v2"
-    KALSHI_WS_URL: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+    # Path to RSA private key file, or the key content itself
+    KALSHI_PRIVATE_KEY_PATH: str = field(default_factory=lambda: os.getenv("KALSHI_PRIVATE_KEY_PATH", ""))
+    # For demo/testing, use demo-api.kalshi.co; for production use trading-api.kalshi.com
+    KALSHI_API_BASE: str = field(default_factory=lambda: os.getenv("KALSHI_API_BASE", "https://trading-api.kalshi.com/trade-api/v2"))
+    KALSHI_WS_URL: str = field(default_factory=lambda: os.getenv("KALSHI_WS_URL", "wss://trading-api.kalshi.com/trade-api/ws/v2"))
 
     # Exchange API keys (optional - public endpoints work for price feeds)
     BINANCE_API_KEY: str = field(default_factory=lambda: os.getenv("BINANCE_API_KEY", ""))
@@ -62,7 +90,7 @@ class Config:
 
     # Trading parameters
     MAX_POSITION_SIZE: int = 100  # Max contracts per position
-    MIN_EDGE_THRESHOLD: float = 0.03  # 3% minimum edge to trade
+    MIN_EDGE_THRESHOLD: float = 0.06  # 6% minimum edge to trade (balanced for safety + opportunity)
     MAX_SPREAD_COST: float = 0.02  # 2% max acceptable spread
     KELLY_FRACTION: float = 0.25  # Fraction of Kelly criterion to use
 
@@ -76,11 +104,26 @@ class Config:
     MAX_CONCURRENT_POSITIONS: int = 5
     MAX_SINGLE_TRADE_RISK: float = 100.0  # Max risk per trade in dollars
 
-    # Market identifiers (Kalshi's 15-min crypto markets)
+    # Market identifiers (Kalshi's hourly crypto price markets)
+    # These are the series tickers for price-at-time markets
     CRYPTO_TICKERS: List[str] = field(default_factory=lambda: [
-        "KXBTC",  # Bitcoin 15-min
-        "KXETH",  # Ethereum 15-min
+        "KXBTCD",   # Bitcoin price at time (e.g., "Bitcoin price on Jan 16, 2026 at 5pm EST?")
+        "KXETHD",   # Ethereum price at time
+        "KXSOLD",   # Solana price at time
+        "KXXRPD",   # Ripple/XRP price at time
     ])
+    
+    # Mapping of Kalshi series to exchange symbols
+    TICKER_TO_SYMBOL: Dict[str, str] = field(default_factory=lambda: {
+        "KXBTCD": "BTC",
+        "KXETHD": "ETH", 
+        "KXSOLD": "SOL",
+        "KXXRPD": "XRP",
+        "KXBTC": "BTC",
+        "KXETH": "ETH",
+        "KXSOLE": "SOL",
+        "KXXRP": "XRP",
+    })
 
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -245,6 +288,8 @@ class PriceFeedManager:
         self.prices: Dict[str, Dict[str, PriceUpdate]] = {
             "BTC": {},
             "ETH": {},
+            "SOL": {},
+            "XRP": {},
         }
         self.callbacks: List[Callable[[PriceUpdate], None]] = []
         self._running = False
@@ -259,10 +304,16 @@ class PriceFeedManager:
         self._running = True
         self._tasks = [
             asyncio.create_task(self._binance_feed()),
+            asyncio.create_task(self._binance_us_feed()),
             asyncio.create_task(self._coinbase_feed()),
             asyncio.create_task(self._kraken_feed()),
+            asyncio.create_task(self._bitstamp_feed()),
+            asyncio.create_task(self._okx_feed()),
+            asyncio.create_task(self._bybit_feed()),
+            asyncio.create_task(self._gemini_feed()),
+            asyncio.create_task(self._htx_feed()),
         ]
-        self.logger.info("Price feeds started")
+        self.logger.info("Price feeds started (9 exchanges: Binance, Binance US, Coinbase, Kraken, Bitstamp, OKX, Bybit, Gemini, HTX)")
 
     async def stop(self):
         """Stop all price feeds"""
@@ -341,15 +392,17 @@ class PriceFeedManager:
                             )
                             self._update_price(update)
             except Exception as e:
-                self.logger.warning(f"Binance feed error: {e}")
-                await asyncio.sleep(1)
+                # Binance global is often blocked in US (HTTP 451) - silently retry
+                if "451" not in str(e):
+                    self.logger.warning(f"Binance feed error: {e}")
+                await asyncio.sleep(30)  # Longer retry for blocked feed
 
     async def _coinbase_feed(self):
         """Coinbase WebSocket price feed"""
         url = "wss://ws-feed.exchange.coinbase.com"
         subscribe_msg = {
             "type": "subscribe",
-            "product_ids": ["BTC-USD", "ETH-USD"],
+            "product_ids": ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"],
             "channels": ["ticker"]
         }
 
@@ -364,7 +417,17 @@ class PriceFeedManager:
                             break
                         data = json.loads(msg)
                         if data.get("type") == "ticker":
-                            symbol = "BTC" if "BTC" in data["product_id"] else "ETH"
+                            product_id = data.get("product_id", "")
+                            if "BTC" in product_id:
+                                symbol = "BTC"
+                            elif "ETH" in product_id:
+                                symbol = "ETH"
+                            elif "SOL" in product_id:
+                                symbol = "SOL"
+                            elif "XRP" in product_id:
+                                symbol = "XRP"
+                            else:
+                                continue
                             update = PriceUpdate(
                                 source="coinbase",
                                 symbol=symbol,
@@ -384,7 +447,7 @@ class PriceFeedManager:
         url = "wss://ws.kraken.com"
         subscribe_msg = {
             "event": "subscribe",
-            "pair": ["XBT/USD", "ETH/USD"],
+            "pair": ["XBT/USD", "ETH/USD", "SOL/USD", "XRP/USD"],
             "subscription": {"name": "ticker"}
         }
 
@@ -401,7 +464,16 @@ class PriceFeedManager:
                         if isinstance(data, list) and len(data) >= 4:
                             ticker_data = data[1]
                             pair = data[3]
-                            symbol = "BTC" if "XBT" in pair else "ETH"
+                            if "XBT" in pair:
+                                symbol = "BTC"
+                            elif "ETH" in pair:
+                                symbol = "ETH"
+                            elif "SOL" in pair:
+                                symbol = "SOL"
+                            elif "XRP" in pair:
+                                symbol = "XRP"
+                            else:
+                                continue
 
                             # Kraken ticker format: [ask, bid, close, volume, vwap, ...]
                             if isinstance(ticker_data, dict):
@@ -419,6 +491,283 @@ class PriceFeedManager:
                 self.logger.warning(f"Kraken feed error: {e}")
                 await asyncio.sleep(1)
 
+    async def _binance_us_feed(self):
+        """Binance.US WebSocket price feed (US-accessible)"""
+        url = "wss://stream.binance.us:9443/ws"
+        streams = ["btcusd@bookTicker", "ethusd@bookTicker", "solusd@bookTicker", "xrpusd@bookTicker"]
+        subscribe_msg = {
+            "method": "SUBSCRIBE",
+            "params": streams,
+            "id": 1
+        }
+
+        while self._running:
+            try:
+                async with websockets.connect(url) as ws:
+                    await ws.send(json.dumps(subscribe_msg))
+                    self.logger.debug("Binance.US feed connected")
+
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        data = json.loads(msg)
+                        if "s" in data:  # Book ticker update
+                            ticker = data["s"].upper()
+                            if "BTC" in ticker:
+                                symbol = "BTC"
+                            elif "ETH" in ticker:
+                                symbol = "ETH"
+                            elif "SOL" in ticker:
+                                symbol = "SOL"
+                            elif "XRP" in ticker:
+                                symbol = "XRP"
+                            else:
+                                continue
+                            update = PriceUpdate(
+                                source="binance_us",
+                                symbol=symbol,
+                                price=(float(data["b"]) + float(data["a"])) / 2,
+                                bid=float(data["b"]),
+                                ask=float(data["a"]),
+                                timestamp_ms=int(time.time() * 1000),
+                            )
+                            self._update_price(update)
+            except Exception as e:
+                self.logger.warning(f"Binance.US feed error: {e}")
+                await asyncio.sleep(5)
+
+    async def _bitstamp_feed(self):
+        """Bitstamp WebSocket price feed"""
+        url = "wss://ws.bitstamp.net"
+
+        while self._running:
+            try:
+                async with websockets.connect(url) as ws:
+                    # Subscribe to BTC, ETH, SOL, XRP live trades
+                    for channel in ["live_trades_btcusd", "live_trades_ethusd", "live_trades_solusd", "live_trades_xrpusd"]:
+                        subscribe_msg = {
+                            "event": "bts:subscribe",
+                            "data": {"channel": channel}
+                        }
+                        await ws.send(json.dumps(subscribe_msg))
+                    self.logger.debug("Bitstamp feed connected")
+
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        data = json.loads(msg)
+                        if data.get("event") == "trade":
+                            channel = data.get("channel", "").lower()
+                            if "btc" in channel:
+                                symbol = "BTC"
+                            elif "eth" in channel:
+                                symbol = "ETH"
+                            elif "sol" in channel:
+                                symbol = "SOL"
+                            elif "xrp" in channel:
+                                symbol = "XRP"
+                            else:
+                                continue
+                            trade_data = data.get("data", {})
+                            update = PriceUpdate(
+                                source="bitstamp",
+                                symbol=symbol,
+                                price=float(trade_data.get("price", 0)),
+                                timestamp_ms=int(time.time() * 1000),
+                            )
+                            self._update_price(update)
+            except Exception as e:
+                self.logger.warning(f"Bitstamp feed error: {e}")
+                await asyncio.sleep(5)
+
+    async def _okx_feed(self):
+        """OKX WebSocket price feed"""
+        url = "wss://ws.okx.com:8443/ws/v5/public"
+        subscribe_msg = {
+            "op": "subscribe",
+            "args": [
+                {"channel": "tickers", "instId": "BTC-USDT"},
+                {"channel": "tickers", "instId": "ETH-USDT"},
+                {"channel": "tickers", "instId": "SOL-USDT"},
+                {"channel": "tickers", "instId": "XRP-USDT"},
+            ]
+        }
+
+        while self._running:
+            try:
+                async with websockets.connect(url) as ws:
+                    await ws.send(json.dumps(subscribe_msg))
+                    self.logger.debug("OKX feed connected")
+
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        data = json.loads(msg)
+                        if "data" in data and data["data"]:
+                            ticker = data["data"][0]
+                            inst_id = ticker.get("instId", "")
+                            if "BTC" in inst_id:
+                                symbol = "BTC"
+                            elif "ETH" in inst_id:
+                                symbol = "ETH"
+                            elif "SOL" in inst_id:
+                                symbol = "SOL"
+                            elif "XRP" in inst_id:
+                                symbol = "XRP"
+                            else:
+                                continue
+                            update = PriceUpdate(
+                                source="okx",
+                                symbol=symbol,
+                                price=float(ticker.get("last", 0)),
+                                bid=float(ticker.get("bidPx", 0)),
+                                ask=float(ticker.get("askPx", 0)),
+                                timestamp_ms=int(time.time() * 1000),
+                                volume_24h=float(ticker.get("vol24h", 0)),
+                            )
+                            self._update_price(update)
+            except Exception as e:
+                self.logger.warning(f"OKX feed error: {e}")
+                await asyncio.sleep(5)
+
+    async def _bybit_feed(self):
+        """Bybit WebSocket price feed"""
+        url = "wss://stream.bybit.com/v5/public/spot"
+        subscribe_msg = {
+            "op": "subscribe",
+            "args": ["tickers.BTCUSDT", "tickers.ETHUSDT", "tickers.SOLUSDT", "tickers.XRPUSDT"]
+        }
+
+        while self._running:
+            try:
+                async with websockets.connect(url) as ws:
+                    await ws.send(json.dumps(subscribe_msg))
+                    self.logger.debug("Bybit feed connected")
+
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        data = json.loads(msg)
+                        if data.get("topic", "").startswith("tickers."):
+                            ticker_data = data.get("data", {})
+                            symbol_raw = ticker_data.get("symbol", "")
+                            if "BTC" in symbol_raw:
+                                symbol = "BTC"
+                            elif "ETH" in symbol_raw:
+                                symbol = "ETH"
+                            elif "SOL" in symbol_raw:
+                                symbol = "SOL"
+                            elif "XRP" in symbol_raw:
+                                symbol = "XRP"
+                            else:
+                                continue
+                            update = PriceUpdate(
+                                source="bybit",
+                                symbol=symbol,
+                                price=float(ticker_data.get("lastPrice", 0)),
+                                bid=float(ticker_data.get("bid1Price", 0)),
+                                ask=float(ticker_data.get("ask1Price", 0)),
+                                timestamp_ms=int(time.time() * 1000),
+                                volume_24h=float(ticker_data.get("volume24h", 0)),
+                            )
+                            self._update_price(update)
+            except Exception as e:
+                self.logger.warning(f"Bybit feed error: {e}")
+                await asyncio.sleep(5)
+
+    async def _gemini_feed(self):
+        """Gemini WebSocket price feed (US-based exchange)"""
+        # Gemini uses separate connections per symbol
+        symbols = [("btcusd", "BTC"), ("ethusd", "ETH"), ("solusd", "SOL")]
+        
+        async def connect_symbol(pair: str, symbol: str):
+            url = f"wss://api.gemini.com/v1/marketdata/{pair}"
+            while self._running:
+                try:
+                    async with websockets.connect(url) as ws:
+                        self.logger.debug(f"Gemini {symbol} feed connected")
+                        
+                        async for msg in ws:
+                            if not self._running:
+                                break
+                            data = json.loads(msg)
+                            if data.get("type") == "update":
+                                events = data.get("events", [])
+                                for event in events:
+                                    if event.get("type") == "trade":
+                                        update = PriceUpdate(
+                                            source="gemini",
+                                            symbol=symbol,
+                                            price=float(event.get("price", 0)),
+                                            timestamp_ms=int(time.time() * 1000),
+                                        )
+                                        self._update_price(update)
+                except Exception as e:
+                    self.logger.warning(f"Gemini {symbol} feed error: {e}")
+                    await asyncio.sleep(5)
+        
+        # Connect to all symbols concurrently
+        tasks = [connect_symbol(pair, sym) for pair, sym in symbols]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _htx_feed(self):
+        """HTX (Huobi) WebSocket price feed"""
+        url = "wss://api.huobi.pro/ws"
+        
+        while self._running:
+            try:
+                async with websockets.connect(url) as ws:
+                    # Subscribe to ticker for each symbol
+                    for pair in ["btcusdt", "ethusdt", "solusdt", "xrpusdt"]:
+                        subscribe_msg = {
+                            "sub": f"market.{pair}.ticker",
+                            "id": f"ticker_{pair}"
+                        }
+                        await ws.send(json.dumps(subscribe_msg))
+                    self.logger.debug("HTX feed connected")
+
+                    async for msg in ws:
+                        if not self._running:
+                            break
+                        # HTX sends gzipped data
+                        import gzip
+                        try:
+                            data = json.loads(gzip.decompress(msg).decode('utf-8'))
+                        except:
+                            data = json.loads(msg) if isinstance(msg, str) else {}
+                        
+                        # Handle ping/pong
+                        if "ping" in data:
+                            await ws.send(json.dumps({"pong": data["ping"]}))
+                            continue
+                        
+                        ch = data.get("ch", "")
+                        if "ticker" in ch and "tick" in data:
+                            tick = data["tick"]
+                            if "btc" in ch:
+                                symbol = "BTC"
+                            elif "eth" in ch:
+                                symbol = "ETH"
+                            elif "sol" in ch:
+                                symbol = "SOL"
+                            elif "xrp" in ch:
+                                symbol = "XRP"
+                            else:
+                                continue
+                            update = PriceUpdate(
+                                source="htx",
+                                symbol=symbol,
+                                price=float(tick.get("close", 0)),
+                                bid=float(tick.get("bid", 0)),
+                                ask=float(tick.get("ask", 0)),
+                                timestamp_ms=int(time.time() * 1000),
+                                volume_24h=float(tick.get("vol", 0)),
+                            )
+                            self._update_price(update)
+            except Exception as e:
+                self.logger.warning(f"HTX feed error: {e}")
+                await asyncio.sleep(5)
+
 # =============================================================================
 # KALSHI API CLIENT
 # =============================================================================
@@ -426,90 +775,176 @@ class PriceFeedManager:
 class KalshiClient:
     """
     Kalshi API client for market data and trading.
-    Handles authentication and rate limiting.
+    Handles RSA-PSS authentication as per Kalshi API v2.
     """
 
     def __init__(self, config: Config, logger: logging.Logger):
         self.config = config
         self.logger = logger
         self._session: Optional[aiohttp.ClientSession] = None
-        self._token: Optional[str] = None
-        self._token_expiry: Optional[datetime] = None
+        self._private_key = None
+        self._authenticated = False
+
+    def _load_private_key(self):
+        """Load RSA private key from file or environment"""
+        key_path = self.config.KALSHI_PRIVATE_KEY_PATH
+        
+        if not key_path:
+            self.logger.warning("No Kalshi private key path - running in read-only mode")
+            return None
+        
+        try:
+            # Check if key_path is a file path or the key content itself
+            if os.path.isfile(key_path):
+                with open(key_path, "rb") as key_file:
+                    private_key = serialization.load_pem_private_key(
+                        key_file.read(),
+                        password=None,
+                        backend=default_backend()
+                    )
+            else:
+                # Assume it's the key content itself (from environment variable)
+                key_content = key_path
+                if not key_content.startswith("-----BEGIN"):
+                    self.logger.error("Invalid private key format")
+                    return None
+                private_key = serialization.load_pem_private_key(
+                    key_content.encode(),
+                    password=None,
+                    backend=default_backend()
+                )
+            return private_key
+        except Exception as e:
+            self.logger.error(f"Failed to load private key: {e}")
+            return None
+
+    def _sign_pss(self, message: str) -> str:
+        """Sign a message using RSA-PSS with SHA256"""
+        if not self._private_key:
+            raise ValueError("Private key not loaded")
+        
+        signature = self._private_key.sign(
+            message.encode('utf-8'),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH  # Must match Kalshi's expected salt length
+            ),
+            hashes.SHA256()
+        )
+        return base64.b64encode(signature).decode('utf-8')
 
     async def initialize(self):
-        """Initialize session and authenticate"""
+        """Initialize session and load credentials"""
         self._session = aiohttp.ClientSession()
-        await self._authenticate()
+        self._private_key = self._load_private_key()
+        
+        if self._private_key and self.config.KALSHI_API_KEY:
+            # Test authentication by fetching balance
+            try:
+                balance = await self.get_balance()
+                self._authenticated = True
+                self.logger.info(f"Authenticated with Kalshi (balance: ${balance:.2f})")
+            except Exception as e:
+                self.logger.error(f"Authentication test failed: {e}")
+                self._authenticated = False
+        else:
+            self.logger.warning("Running in read-only mode (no credentials)")
 
     async def close(self):
         """Close session"""
         if self._session:
             await self._session.close()
 
-    async def _authenticate(self):
-        """Authenticate with Kalshi API"""
-        if not self.config.KALSHI_API_KEY:
-            self.logger.warning("No Kalshi API key - running in read-only mode")
-            return
-
-        # Kalshi uses timestamped HMAC authentication
-        timestamp = str(int(time.time() * 1000))
-        method = "POST"
-        path = "/login"
-
-        msg = f"{timestamp}{method}{path}"
-        signature = hmac.new(
-            self.config.KALSHI_API_SECRET.encode(),
-            msg.encode(),
-            hashlib.sha256
-        ).hexdigest()
-
-        headers = {
-            "KALSHI-ACCESS-KEY": self.config.KALSHI_API_KEY,
-            "KALSHI-ACCESS-SIGNATURE": signature,
-            "KALSHI-ACCESS-TIMESTAMP": timestamp,
-        }
-
-        async with self._session.post(
-            f"{self.config.KALSHI_API_BASE}/login",
-            headers=headers
-        ) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                self._token = data.get("token")
-                self._token_expiry = datetime.now(timezone.utc) + timedelta(hours=24)
-                self.logger.info("Authenticated with Kalshi")
-            else:
-                self.logger.error(f"Auth failed: {await resp.text()}")
-
     def _get_auth_headers(self, method: str, path: str) -> Dict[str, str]:
-        """Generate authentication headers for a request"""
+        """Generate RSA-PSS authentication headers for a request"""
         timestamp = str(int(time.time() * 1000))
-        msg = f"{timestamp}{method}{path}"
-        signature = hmac.new(
-            self.config.KALSHI_API_SECRET.encode(),
-            msg.encode(),
-            hashlib.sha256
-        ).hexdigest()
-
-        return {
-            "KALSHI-ACCESS-KEY": self.config.KALSHI_API_KEY,
-            "KALSHI-ACCESS-SIGNATURE": signature,
-            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        
+        # Build full path for signing (must include /trade-api/v2 prefix)
+        # The path parameter is relative to the API base, so we need to include the API path prefix
+        full_path = f"/trade-api/v2{path}"
+        path_without_query = full_path.split('?')[0]
+        msg_string = f"{timestamp}{method}{path_without_query}"
+        
+        headers = {
             "Content-Type": "application/json",
         }
+        
+        if self._private_key and self.config.KALSHI_API_KEY:
+            signature = self._sign_pss(msg_string)
+            headers.update({
+                "KALSHI-ACCESS-KEY": self.config.KALSHI_API_KEY,
+                "KALSHI-ACCESS-SIGNATURE": signature,
+                "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            })
+        
+        return headers
 
-    async def get_markets(self, ticker_prefix: str) -> List[KalshiMarket]:
-        """Fetch current markets for a crypto ticker"""
-        path = f"/markets?ticker={ticker_prefix}&status=open"
+    async def get_markets(self, series_ticker: str) -> List[KalshiMarket]:
+        """Fetch current markets for a crypto series ticker (e.g., KXBTCD for Bitcoin hourly)"""
+        # First get events for this series to find currently active ones
+        events_path = f"/events?series_ticker={series_ticker}&status=open"
+        headers = self._get_auth_headers("GET", events_path)
+        
+        async with self._session.get(
+            f"{self.config.KALSHI_API_BASE}{events_path}",
+            headers=headers
+        ) as resp:
+            if resp.status != 200:
+                self.logger.debug(f"Failed to get events: {await resp.text()}")
+                # Fall back to direct market search
+                return await self._get_markets_direct(series_ticker)
+            
+            events_data = await resp.json()
+            events = events_data.get("events", [])
+            
+            if not events:
+                # Fall back to direct market search
+                return await self._get_markets_direct(series_ticker)
+        
+        # Get markets for the most relevant events (soonest expiring)
+        all_markets = []
+        for event in events[:3]:  # Check up to 3 events
+            event_ticker = event.get("event_ticker")
+            if not event_ticker:
+                continue
+                
+            markets_path = f"/markets?event_ticker={event_ticker}&status=open"
+            headers = self._get_auth_headers("GET", markets_path)
+            
+            async with self._session.get(
+                f"{self.config.KALSHI_API_BASE}{markets_path}",
+                headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                    
+                data = await resp.json()
+                
+                for m in data.get("markets", []):
+                    try:
+                        market = self._parse_market(m)
+                        if market:
+                            all_markets.append(market)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to parse market: {e}")
+        
+        return all_markets
+    
+    async def _get_markets_direct(self, ticker_prefix: str) -> List[KalshiMarket]:
+        """Direct market search by ticker prefix"""
+        path = f"/markets?ticker={ticker_prefix}&status=open&limit=100"
         headers = self._get_auth_headers("GET", path)
 
         async with self._session.get(
             f"{self.config.KALSHI_API_BASE}{path}",
             headers=headers
         ) as resp:
+            if resp.status == 403:
+                self.logger.warning("Rate limited by Kalshi - waiting 30 seconds")
+                await asyncio.sleep(30)
+                return []
             if resp.status != 200:
-                self.logger.error(f"Failed to get markets: {await resp.text()}")
+                self.logger.error(f"Failed to get markets (status {resp.status})")
                 return []
 
             data = await resp.json()
@@ -517,35 +952,68 @@ class KalshiClient:
 
             for m in data.get("markets", []):
                 try:
-                    # Parse strike price from subtitle (e.g., "BTC above $95,000")
-                    strike = None
-                    subtitle = m.get("subtitle", "")
-                    if "$" in subtitle:
-                        price_str = subtitle.split("$")[1].replace(",", "").split()[0]
-                        strike = float(price_str)
-
-                    market = KalshiMarket(
-                        ticker=m["ticker"],
-                        event_ticker=m["event_ticker"],
-                        title=m["title"],
-                        subtitle=subtitle,
-                        yes_bid=m.get("yes_bid", 0) / 100,  # Convert from cents
-                        yes_ask=m.get("yes_ask", 0) / 100,
-                        no_bid=m.get("no_bid", 0) / 100,
-                        no_ask=m.get("no_ask", 0) / 100,
-                        volume=m.get("volume", 0),
-                        open_interest=m.get("open_interest", 0),
-                        strike_price=strike,
-                        expiration_time=datetime.fromisoformat(
-                            m["close_time"].replace("Z", "+00:00")
-                        ),
-                        last_updated=datetime.now(timezone.utc),
-                    )
-                    markets.append(market)
+                    market = self._parse_market(m)
+                    if market:
+                        markets.append(market)
                 except Exception as e:
                     self.logger.warning(f"Failed to parse market: {e}")
 
-        return markets
+            return markets
+    
+    def _parse_market(self, m: dict) -> Optional[KalshiMarket]:
+        """Parse a market from API response"""
+        # Parse strike price from subtitle (e.g., "$95,000 or above" or "$3,330 to 3,369.99")
+        strike = None
+        subtitle = m.get("subtitle", "")
+        
+        if "$" in subtitle:
+            try:
+                # Extract the first dollar amount
+                price_str = subtitle.split("$")[1].replace(",", "").split()[0]
+                # Remove trailing non-numeric characters
+                price_str = ''.join(c for c in price_str if c.isdigit() or c == '.')
+                if price_str:
+                    strike = float(price_str)
+            except (ValueError, IndexError):
+                pass
+        
+        # Also try to extract from ticker (e.g., KXBTCD-26JAN1617-T95999.99)
+        if strike is None:
+            ticker = m.get("ticker", "")
+            if "-T" in ticker or "-B" in ticker:
+                try:
+                    # Extract number after -T or -B
+                    parts = ticker.split("-")
+                    for part in parts:
+                        if part.startswith("T") or part.startswith("B"):
+                            num_str = part[1:]
+                            strike = float(num_str)
+                            break
+                except (ValueError, IndexError):
+                    pass
+        
+        # Get expiration time
+        close_time = m.get("close_time") or m.get("expiration_time")
+        if close_time:
+            expiration = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+        else:
+            expiration = datetime.now(timezone.utc) + timedelta(hours=1)
+
+        return KalshiMarket(
+            ticker=m["ticker"],
+            event_ticker=m.get("event_ticker", ""),
+            title=m.get("title", ""),
+            subtitle=subtitle,
+            yes_bid=(m.get("yes_bid") or 0) / 100,  # Convert from cents
+            yes_ask=(m.get("yes_ask") or 0) / 100,
+            no_bid=(m.get("no_bid") or 0) / 100,
+            no_ask=(m.get("no_ask") or 0) / 100,
+            volume=m.get("volume", 0),
+            open_interest=m.get("open_interest", 0),
+            strike_price=strike,
+            expiration_time=expiration,
+            last_updated=datetime.now(timezone.utc),
+        )
 
     async def place_order(
         self,
@@ -555,7 +1023,7 @@ class KalshiClient:
         price: float,
     ) -> TradeResult:
         """Place a limit order"""
-        if not self._token:
+        if not self._authenticated:
             return TradeResult(
                 order_id="",
                 ticker=ticker,
@@ -570,14 +1038,21 @@ class KalshiClient:
         path = "/portfolio/orders"
         headers = self._get_auth_headers("POST", path)
 
+        # Build order data - Kalshi API requires exactly one price field
         order_data = {
             "ticker": ticker,
             "type": "limit",
             "action": "buy",
-            "side": side.value,
+            "side": side.value.lower(),  # 'yes' or 'no'
             "count": quantity,
-            "yes_price" if side == Side.YES else "no_price": int(price * 100),
         }
+        
+        # Add the correct price field based on side
+        price_cents = int(price * 100)
+        if side == Side.YES:
+            order_data["yes_price"] = price_cents
+        else:
+            order_data["no_price"] = price_cents
 
         async with self._session.post(
             f"{self.config.KALSHI_API_BASE}{path}",
@@ -586,9 +1061,11 @@ class KalshiClient:
         ) as resp:
             data = await resp.json()
 
-            if resp.status == 200:
+            if resp.status in [200, 201]:  # 201 Created is success for orders!
+                order_data = data.get("order", {})
+                self.logger.info(f"ORDER PLACED: {order_data.get('order_id', 'unknown')} status={order_data.get('status', 'unknown')}")
                 return TradeResult(
-                    order_id=data.get("order", {}).get("order_id", ""),
+                    order_id=order_data.get("order_id", ""),
                     ticker=ticker,
                     side=side,
                     quantity=quantity,
@@ -597,6 +1074,7 @@ class KalshiClient:
                     success=True,
                 )
             else:
+                self.logger.warning(f"Order API error: status={resp.status} data={data}")
                 return TradeResult(
                     order_id="",
                     ticker=ticker,
@@ -605,12 +1083,97 @@ class KalshiClient:
                     price=price,
                     timestamp=datetime.now(timezone.utc),
                     success=False,
-                    error=data.get("error", str(resp.status)),
+                    error=data.get("error", {}).get("message", str(resp.status)),
                 )
+
+    async def sell_position(
+        self,
+        ticker: str,
+        side: Side,
+        quantity: int,
+        price: float,
+    ) -> TradeResult:
+        """Sell/close a position"""
+        if not self._authenticated:
+            return TradeResult(
+                order_id="",
+                ticker=ticker,
+                side=side,
+                quantity=quantity,
+                price=price,
+                timestamp=datetime.now(timezone.utc),
+                success=False,
+                error="Not authenticated",
+            )
+
+        path = "/portfolio/orders"
+        headers = self._get_auth_headers("POST", path)
+
+        # Build SELL order data
+        order_data = {
+            "ticker": ticker,
+            "type": "limit",
+            "action": "sell",  # SELL instead of buy
+            "side": side.value.lower(),
+            "count": quantity,
+        }
+        
+        price_cents = int(price * 100)
+        if side == Side.YES:
+            order_data["yes_price"] = price_cents
+        else:
+            order_data["no_price"] = price_cents
+
+        self.logger.info(f"SELLING: {ticker} {side.value} x{quantity} @ ${price:.2f}")
+
+        async with self._session.post(
+            f"{self.config.KALSHI_API_BASE}{path}",
+            headers=headers,
+            json=order_data,
+        ) as resp:
+            data = await resp.json()
+
+            if resp.status in [200, 201]:
+                order_data = data.get("order", {})
+                self.logger.info(f"SELL ORDER PLACED: {order_data.get('order_id', 'unknown')}")
+                return TradeResult(
+                    order_id=order_data.get("order_id", ""),
+                    ticker=ticker,
+                    side=side,
+                    quantity=quantity,
+                    price=price,
+                    timestamp=datetime.now(timezone.utc),
+                    success=True,
+                )
+            else:
+                self.logger.warning(f"Sell failed: {data}")
+                return TradeResult(
+                    order_id="",
+                    ticker=ticker,
+                    side=side,
+                    quantity=quantity,
+                    price=price,
+                    timestamp=datetime.now(timezone.utc),
+                    success=False,
+                    error=data.get("error", {}).get("message", str(resp.status)),
+                )
+
+    async def get_market_orderbook(self, ticker: str) -> dict:
+        """Get current orderbook/prices for a market"""
+        path = f"/markets/{ticker}"
+        headers = self._get_auth_headers("GET", path)
+
+        async with self._session.get(
+            f"{self.config.KALSHI_API_BASE}{path}",
+            headers=headers,
+        ) as resp:
+            if resp.status == 200:
+                return await resp.json()
+            return {}
 
     async def get_positions(self) -> List[Position]:
         """Get current positions"""
-        if not self._token:
+        if not self._authenticated:
             return []
 
         path = "/portfolio/positions"
@@ -643,7 +1206,7 @@ class KalshiClient:
 
     async def get_balance(self) -> float:
         """Get account balance"""
-        if not self._token:
+        if not self._private_key:
             return 0.0
 
         path = "/portfolio/balance"
@@ -665,32 +1228,65 @@ class KalshiClient:
 class ProbabilityEngine:
     """
     Calculates fair value probabilities for crypto prediction markets.
-    Uses real-time price data and volatility estimates.
+    Uses real-time price data, volatility estimates, AND momentum detection.
+    
+    CRITICAL FIX: Added price trend/momentum analysis to avoid betting against
+    clear directional moves. Pure random-walk models fail in trending markets.
     """
 
     def __init__(self, config: Config, logger: logging.Logger):
         self.config = config
         self.logger = logger
 
-        # Rolling volatility calculation (1-minute returns)
+        # Rolling price history (timestamp_ms, price)
         self.price_history: Dict[str, deque] = {
-            "BTC": deque(maxlen=100),
-            "ETH": deque(maxlen=100),
+            "BTC": deque(maxlen=300),  # ~5 min of data at 1/sec
+            "ETH": deque(maxlen=300),
+            "SOL": deque(maxlen=300),
+            "XRP": deque(maxlen=300),
         }
 
-        # Base annualized volatility estimates (updated dynamically)
+        # Base annualized volatility estimates
         self.base_volatility = {
-            "BTC": 0.60,  # 60% annualized
-            "ETH": 0.75,  # 75% annualized
+            "BTC": 0.60,   # 60% annualized - most stable
+            "ETH": 0.75,   # 75% annualized
+            "SOL": 0.95,   # 95% annualized - higher volatility
+            "XRP": 0.85,   # 85% annualized
         }
 
     def update_price(self, symbol: str, price: float, timestamp_ms: int):
-        """Update price history for volatility calculation"""
+        """Update price history for volatility and momentum calculation"""
         self.price_history[symbol].append((timestamp_ms, price))
+
+    def _calculate_momentum(self, symbol: str) -> Tuple[float, float]:
+        """
+        Calculate price momentum over multiple timeframes.
+        Returns (short_term_change_pct, medium_term_change_pct)
+        
+        Positive = price going UP
+        Negative = price going DOWN
+        """
+        history = list(self.price_history.get(symbol, []))
+        if len(history) < 30:
+            return (0.0, 0.0)
+        
+        current_price = history[-1][1]
+        
+        # Short-term: last 30 seconds
+        short_idx = max(0, len(history) - 30)
+        short_price = history[short_idx][1]
+        short_change = (current_price - short_price) / short_price if short_price > 0 else 0
+        
+        # Medium-term: last 2 minutes (120 samples)
+        med_idx = max(0, len(history) - 120)
+        med_price = history[med_idx][1]
+        med_change = (current_price - med_price) / med_price if med_price > 0 else 0
+        
+        return (short_change, med_change)
 
     def _estimate_realized_volatility(self, symbol: str) -> float:
         """Estimate short-term realized volatility from recent prices"""
-        history = self.price_history.get(symbol, [])
+        history = list(self.price_history.get(symbol, []))
         if len(history) < 10:
             return self.base_volatility.get(symbol, 0.65)
 
@@ -715,17 +1311,22 @@ class ProbabilityEngine:
         strike_price: float,
         time_to_expiry_seconds: float,
         symbol: str = "BTC",
-    ) -> float:
+    ) -> Tuple[float, float, str]:
         """
         Calculate fair probability of price being above strike at expiration.
+        
+        Returns: (probability, confidence, trend_direction)
+        - probability: 0-1 fair value
+        - confidence: 0-1 how confident we are (low if conflicting signals)
+        - trend_direction: 'UP', 'DOWN', or 'NEUTRAL'
 
-        Uses a simplified Black-Scholes-like model adjusted for:
-        - Short time horizons (15 minutes)
-        - High short-term volatility
-        - Mean reversion tendencies
+        Uses:
+        - Black-Scholes base probability
+        - Momentum adjustment (trending prices continue short-term)
+        - Reduced confidence when model and market disagree significantly
         """
         if time_to_expiry_seconds <= 0:
-            return 1.0 if current_price >= strike_price else 0.0
+            return (1.0 if current_price >= strike_price else 0.0, 1.0, 'NEUTRAL')
 
         # Convert to years
         T = time_to_expiry_seconds / (365.25 * 24 * 3600)
@@ -735,29 +1336,62 @@ class ProbabilityEngine:
 
         # Log moneyness
         if current_price <= 0 or strike_price <= 0:
-            return 0.5
+            return (0.5, 0.0, 'NEUTRAL')
         log_moneyness = np.log(current_price / strike_price)
 
-        # Drift adjustment for short-term (near zero for 15-min)
-        drift = 0.0
+        # Get momentum
+        short_momentum, med_momentum = self._calculate_momentum(symbol)
+        
+        # Determine trend direction
+        if short_momentum > 0.001 and med_momentum > 0.001:
+            trend = 'UP'
+            # If trending up, add positive drift
+            drift_adjustment = min(short_momentum * 50, 0.05)  # Cap at 5% drift
+        elif short_momentum < -0.001 and med_momentum < -0.001:
+            trend = 'DOWN'
+            # If trending down, add negative drift
+            drift_adjustment = max(short_momentum * 50, -0.05)  # Cap at -5% drift
+        else:
+            trend = 'NEUTRAL'
+            drift_adjustment = 0.0
+
+        # Base drift (near zero for short-term)
+        drift = drift_adjustment
 
         # d2 from Black-Scholes (probability under risk-neutral measure)
         vol_sqrt_t = sigma * np.sqrt(T)
         if vol_sqrt_t < 0.0001:
-            return 1.0 if current_price >= strike_price else 0.0
+            return (1.0 if current_price >= strike_price else 0.0, 1.0, trend)
 
         d2 = (log_moneyness + (drift - 0.5 * sigma**2) * T) / vol_sqrt_t
 
         # N(d2) = probability of finishing above strike
         prob = norm.cdf(d2)
 
-        # Apply mean-reversion adjustment for very short horizons
-        # Price tends to mean-revert less than Brownian motion suggests
+        # Apply conservative adjustment - reduce extreme probabilities
+        # This prevents overconfidence when price is near strike
         if T < 1/365:  # Less than 1 day
-            mean_reversion_factor = 0.85  # Reduce extreme probabilities
+            # Stronger mean-reversion for uncertain markets
+            mean_reversion_factor = 0.70  # MORE conservative than before
             prob = 0.5 + (prob - 0.5) * mean_reversion_factor
 
-        return np.clip(prob, 0.001, 0.999)
+        # Calculate confidence based on:
+        # 1. Distance from strike (very close = uncertain)
+        # 2. Agreement of momentum signals
+        # 3. Number of price samples
+        
+        distance_ratio = abs(current_price - strike_price) / strike_price
+        distance_confidence = min(distance_ratio * 20, 1.0)  # Max confidence at 5% away
+        
+        # Momentum agreement
+        if (short_momentum > 0 and med_momentum > 0) or (short_momentum < 0 and med_momentum < 0):
+            momentum_confidence = 0.8
+        else:
+            momentum_confidence = 0.4  # Conflicting signals = low confidence
+        
+        confidence = distance_confidence * momentum_confidence
+
+        return (np.clip(prob, 0.001, 0.999), confidence, trend)
 
     def calculate_edge(
         self,
@@ -809,15 +1443,36 @@ class SignalGenerator:
             if signal:
                 signals.append(signal)
 
-        # Sort by edge (highest first)
-        signals.sort(key=lambda s: abs(s.edge), reverse=True)
+        # Sort by EXPECTED VALUE (edge * fair_value * confidence)
+        # This prioritizes trades that are:
+        # 1. High probability of winning (fair_value close to 1)
+        # 2. Good edge (mispricing)
+        # 3. High confidence (trend alignment, multiple sources)
+        def expected_value(s: TradeSignal) -> float:
+            # EV = probability of winning * potential profit - probability of losing * cost
+            # Simplified: edge * confidence * (1 if high prob else discount)
+            prob_bonus = 1.0 + (s.fair_value - 0.5) * 0.5  # Bonus for high probability trades
+            return abs(s.edge) * s.confidence * prob_bonus
+        
+        signals.sort(key=expected_value, reverse=True)
         return signals
 
     def _evaluate_market(self, market: KalshiMarket) -> Optional[TradeSignal]:
         """Evaluate a single market for trading opportunity"""
 
-        # Determine which crypto this market is for
-        symbol = "BTC" if "BTC" in market.ticker else "ETH"
+        # Determine which crypto this market is for based on ticker
+        ticker_upper = market.ticker.upper()
+        if "BTC" in ticker_upper:
+            symbol = "BTC"
+        elif "ETH" in ticker_upper:
+            symbol = "ETH"
+        elif "SOL" in ticker_upper:
+            symbol = "SOL"
+        elif "XRP" in ticker_upper:
+            symbol = "XRP"
+        else:
+            self.logger.debug(f"Unknown crypto in ticker: {market.ticker}")
+            return None
 
         # Get current aggregated price
         price_data = self.price_feed.get_aggregated_price(symbol)
@@ -834,49 +1489,103 @@ class SignalGenerator:
         if time_to_expiry <= 0:
             return None
 
-        # Calculate fair probability
-        fair_prob = self.prob_engine.calculate_fair_probability(
+        # Calculate fair probability with momentum analysis
+        fair_prob, model_confidence, trend = self.prob_engine.calculate_fair_probability(
             current_price=crypto_price,
             strike_price=market.strike_price,
             time_to_expiry_seconds=time_to_expiry,
             symbol=symbol,
         )
 
-        # Check both YES and NO sides
-        yes_edge = self.prob_engine.calculate_edge(fair_prob, market.yes_ask, Side.YES)
-        no_edge = self.prob_engine.calculate_edge(fair_prob, market.no_ask, Side.NO)
+        # Check both YES and NO sides - but only if prices are valid (not 0 or None)
+        yes_price = market.yes_ask or 0
+        no_price = market.no_ask or 0
+        
+        # Skip markets with no liquidity (price is 0 or very close to extremes)
+        if yes_price <= 0.01 and no_price <= 0.01:
+            return None
+        
+        yes_edge = self.prob_engine.calculate_edge(fair_prob, yes_price, Side.YES) if yes_price > 0.01 else -1
+        no_edge = self.prob_engine.calculate_edge(fair_prob, no_price, Side.NO) if no_price > 0.01 else -1
 
-        # Choose better side
-        if yes_edge > no_edge and yes_edge > self.config.MIN_EDGE_THRESHOLD:
+        # ================================================================
+        # CRITICAL TREND CHECK: Don't bet against clear price trends!
+        # If price is trending DOWN, don't bet YES (above strike)
+        # If price is trending UP, don't bet NO (below strike)
+        # ================================================================
+        if trend == 'DOWN' and yes_edge > no_edge:
+            # Price trending down but model says buy YES? Skip or reduce confidence
+            self.logger.debug(f"Trend mismatch {market.ticker}: DOWN trend but YES signal - skipping")
+            yes_edge = -1  # Disqualify YES
+        elif trend == 'UP' and no_edge > yes_edge:
+            # Price trending up but model says buy NO? Skip or reduce confidence
+            self.logger.debug(f"Trend mismatch {market.ticker}: UP trend but NO signal - skipping")
+            no_edge = -1  # Disqualify NO
+
+        # Choose better side - only consider sides with valid prices
+        if yes_edge > no_edge and yes_edge > self.config.MIN_EDGE_THRESHOLD and yes_price > 0.01:
             side = Side.YES
             edge = yes_edge
-            market_price = market.yes_ask
-        elif no_edge > self.config.MIN_EDGE_THRESHOLD:
+            market_price = yes_price
+        elif no_edge > self.config.MIN_EDGE_THRESHOLD and no_price > 0.01:
             side = Side.NO
             edge = no_edge
-            market_price = market.no_ask
+            market_price = no_price
         else:
+            return None
+        
+        # Skip if edge is unrealistically high (likely illiquid market)
+        if edge > 0.40:  # Reduced from 50% - 40% edge is suspicious
+            self.logger.debug(f"Skipping {market.ticker}: edge too high ({edge:.1%}) - likely illiquid")
             return None
 
         # Check spread isn't too wide
         if market.spread > self.config.MAX_SPREAD_COST:
             self.logger.debug(f"Skipping {market.ticker}: spread too wide ({market.spread:.2%})")
             return None
+        
+        # ================================================================
+        # PREFER HIGHER PROBABILITY TRADES
+        # Skip low-probability gambles (fair_value < 0.35 or > 0.95)
+        # These are either unlikely to win or have minimal upside
+        # ================================================================
+        fair_value_for_side = fair_prob if side == Side.YES else (1 - fair_prob)
+        if fair_value_for_side < 0.35:
+            self.logger.debug(f"Skipping {market.ticker}: low probability ({fair_value_for_side:.1%})")
+            return None
+        if fair_value_for_side > 0.95:
+            self.logger.debug(f"Skipping {market.ticker}: minimal upside ({fair_value_for_side:.1%})")
+            return None
 
         # Calculate confidence based on:
         # 1. Number of price sources
         # 2. Time to expiry (more confident closer to expiry)
         # 3. Edge magnitude
+        # 4. Model confidence (from momentum agreement)
+        # 5. Trend alignment
         source_confidence = min(num_sources / 3, 1.0)
         time_confidence = 1.0 if time_to_expiry < self.config.LATENCY_WINDOW_SECONDS else 0.7
         edge_confidence = min(abs(edge) / 0.10, 1.0)  # Max at 10% edge
-        confidence = source_confidence * time_confidence * edge_confidence
+        
+        # Bonus confidence if trend aligns with our bet
+        trend_bonus = 1.0
+        if (trend == 'UP' and side == Side.YES) or (trend == 'DOWN' and side == Side.NO):
+            trend_bonus = 1.2  # 20% confidence boost for trend alignment
+        
+        confidence = source_confidence * time_confidence * edge_confidence * model_confidence * trend_bonus
+        confidence = min(confidence, 1.0)  # Cap at 100%
 
-        # Calculate position size using fractional Kelly
+        # Calculate position size using fractional Kelly with confidence scaling
         kelly_fraction = self._kelly_criterion(edge, market_price, fair_prob)
-        recommended_size = int(
-            kelly_fraction * self.config.KELLY_FRACTION * self.config.MAX_POSITION_SIZE
-        )
+        
+        # CRITICAL: Scale position size by confidence AND fair value
+        # Higher confidence + higher probability = MORE contracts
+        # This ensures we "bet big when we're confident and likely to win"
+        confidence_multiplier = confidence  # 0 to 1
+        prob_multiplier = 0.5 + fair_prob * 0.5  # 0.5 to 1.0 (favor high prob trades)
+        
+        base_size = kelly_fraction * self.config.KELLY_FRACTION * self.config.MAX_POSITION_SIZE
+        recommended_size = int(base_size * confidence_multiplier * prob_multiplier)
         recommended_size = max(1, min(recommended_size, self.config.MAX_POSITION_SIZE))
 
         return TradeSignal(
@@ -963,8 +1672,8 @@ class RiskManager:
         if trade_risk > self.config.MAX_SINGLE_TRADE_RISK:
             return False, f"Trade risk too high: ${trade_risk:.2f}"
 
-        # Check minimum confidence
-        if signal.confidence < 0.5:
+        # Check minimum confidence (lowered to 0.05 = 5% since we have trend protection)
+        if signal.confidence < 0.05:
             return False, f"Confidence too low: {signal.confidence:.2%}"
 
         return True, "OK"
@@ -1033,10 +1742,10 @@ class ExecutionEngine:
         # Risk check
         can_trade, reason = self.risk.can_trade(signal)
         if not can_trade:
-            self.logger.debug(f"Trade blocked: {reason}")
+            self.logger.warning(f"Trade BLOCKED: {reason}")
             return None
-
-        self.logger.info(f"Executing: {signal}")
+        
+        self.logger.info(f"Risk check PASSED for {signal.market.ticker}")
 
         # Determine execution price
         # For latency arb, we want to be aggressive - use the ask price
@@ -1044,9 +1753,46 @@ class ExecutionEngine:
             exec_price = signal.market.yes_ask
         else:
             exec_price = signal.market.no_ask
+        
+        # Skip if no valid price (market has no liquidity)
+        if exec_price is None or exec_price <= 0.01:
+            self.logger.info(f"Trade SKIP: no valid price (${exec_price}) for {signal.market.ticker}")
+            return None
+        
+        # Skip if price is too high (would risk too much)
+        if exec_price > 0.95:
+            self.logger.info(f"Trade SKIP: price too high (${exec_price}) for {signal.market.ticker}")
+            return None
 
-        # Adjust size based on available liquidity (simplified)
-        size = min(signal.recommended_size, 50)  # Cap at 50 for liquidity
+        self.logger.info(f"EXECUTING TRADE: {signal.market.ticker} {signal.side.value} @ ${exec_price:.2f}")
+
+        # ================================================================
+        # SMART POSITION SIZING: More capital on higher confidence trades
+        # ================================================================
+        # Base risk scales with confidence:
+        # - Low confidence (0.3): $3 max risk
+        # - Medium confidence (0.5): $5 max risk  
+        # - High confidence (0.7+): $7-10 max risk
+        # 
+        # With $20 balance, max single trade = 50% = $10
+        base_max_risk = 10.0  # Absolute max per trade
+        confidence_scaled_risk = base_max_risk * signal.confidence
+        max_risk_per_trade = max(2.0, min(confidence_scaled_risk, base_max_risk))
+        
+        # Additional bonus for high probability trades (fair_value > 0.7)
+        # These are "likely to win" so we can size up slightly
+        if signal.fair_value > 0.75:
+            max_risk_per_trade = min(max_risk_per_trade * 1.25, base_max_risk)
+        
+        max_contracts = int(max_risk_per_trade / exec_price) if exec_price > 0 else 0
+        size = min(signal.recommended_size, max_contracts, 25)  # Cap at 25 contracts
+        
+        if size < 1:
+            self.logger.debug(f"Skipping: calculated size too small")
+            return None
+        
+        # Log the sizing decision
+        self.logger.debug(f"Sizing: conf={signal.confidence:.2f} fair={signal.fair_value:.2f} risk=${max_risk_per_trade:.2f} size={size}")
 
         # Place order
         result = await self.kalshi.place_order(
@@ -1065,6 +1811,184 @@ class ExecutionEngine:
         return result
 
 # =============================================================================
+# POSITION GUARDIAN - Auto-Exit Protection
+# =============================================================================
+
+@dataclass
+class GuardedPosition:
+    """A position being monitored for auto-exit"""
+    ticker: str
+    side: Side
+    qty: int
+    strike: float
+    cost_basis: float
+    asset: str  # BTC or ETH
+    exit_trigger: float
+
+
+class PositionGuardian:
+    """
+    Monitors positions and auto-sells when price approaches strike.
+    Protects winning positions from turning into losses.
+    """
+    
+    # How close price can get to strike before auto-selling (as % of strike)
+    EXIT_BUFFER_PERCENT = 0.005  # 0.5% buffer
+    
+    def __init__(
+        self,
+        config: Config,
+        logger: logging.Logger,
+        kalshi_client: KalshiClient,
+        price_feed: PriceFeedManager,
+    ):
+        self.config = config
+        self.logger = logger
+        self.kalshi = kalshi_client
+        self.price_feed = price_feed
+        self.guarded_positions: Dict[str, GuardedPosition] = {}
+        self.sold_tickers: set = set()
+    
+    def parse_ticker(self, ticker: str) -> tuple:
+        """Parse ticker to get asset, strike"""
+        # Format: KXBTCD-26JAN1617-T97499.99
+        parts = ticker.split("-")
+        if len(parts) < 3:
+            return None, None
+        
+        asset_code = parts[0]
+        strike_str = parts[2]
+        
+        if "BTC" in asset_code:
+            asset = "BTC"
+        elif "ETH" in asset_code:
+            asset = "ETH"
+        else:
+            return None, None
+        
+        if strike_str.startswith("T") or strike_str.startswith("B"):
+            try:
+                strike = float(strike_str[1:])
+            except:
+                return None, None
+        else:
+            return None, None
+        
+        return asset, strike
+    
+    async def load_positions(self):
+        """Load current positions from Kalshi"""
+        try:
+            positions = await self.kalshi.get_positions()
+        except Exception as e:
+            self.logger.error(f"Error loading positions for guardian: {e}")
+            return
+        
+        self.guarded_positions = {}
+        
+        for pos in positions:
+            if pos.quantity == 0:
+                continue
+            if pos.ticker in self.sold_tickers:
+                continue
+            
+            asset, strike = self.parse_ticker(pos.ticker)
+            if not asset or not strike:
+                continue
+            
+            # Calculate exit trigger
+            buffer = strike * self.EXIT_BUFFER_PERCENT
+            
+            if pos.side == Side.NO:
+                # Betting price stays BELOW strike - exit if price rises toward strike
+                exit_trigger = strike - buffer
+            else:
+                # Betting price stays ABOVE strike - exit if price falls toward strike
+                exit_trigger = strike + buffer
+            
+            guarded = GuardedPosition(
+                ticker=pos.ticker,
+                side=pos.side,
+                qty=pos.quantity,
+                strike=strike,
+                cost_basis=pos.entry_price,
+                asset=asset,
+                exit_trigger=exit_trigger,
+            )
+            
+            self.guarded_positions[pos.ticker] = guarded
+            self.logger.info(
+                f"GUARDIAN: Monitoring {pos.ticker} | {pos.quantity} {pos.side.value.upper()} @ ${strike:,.0f} | "
+                f"Exit if {asset} {'rises above' if pos.side == Side.NO else 'falls below'} ${exit_trigger:,.0f}"
+            )
+        
+        self.logger.info(f"GUARDIAN: Monitoring {len(self.guarded_positions)} positions")
+    
+    async def check_and_protect(self) -> List[str]:
+        """Check prices and sell if needed - returns list of actions taken"""
+        actions = []
+        
+        for ticker, pos in list(self.guarded_positions.items()):
+            # Get current price from our price feed
+            price_data = self.price_feed.get_aggregated_price(pos.asset)
+            if not price_data:
+                continue
+            
+            current_price, _ = price_data
+            
+            should_exit = False
+            
+            if pos.side == Side.NO:
+                # Betting price stays BELOW strike - exit if price rises above trigger
+                if current_price >= pos.exit_trigger:
+                    should_exit = True
+            else:
+                # Betting price stays ABOVE strike - exit if price falls below trigger
+                if current_price <= pos.exit_trigger:
+                    should_exit = True
+            
+            if should_exit:
+                self.logger.warning(f"{'!'*60}")
+                self.logger.warning(f"GUARDIAN AUTO-EXIT TRIGGERED!")
+                self.logger.warning(f"Position: {ticker}")
+                self.logger.warning(f"{pos.asset}: ${current_price:,.2f} | Strike: ${pos.strike:,.2f} | Trigger: ${pos.exit_trigger:,.2f}")
+                
+                # Get current bid price
+                try:
+                    market_data = await self.kalshi.get_market_orderbook(ticker)
+                    market = market_data.get("market", {})
+                    
+                    if pos.side == Side.YES:
+                        sell_price = market.get("yes_bid", 0) / 100
+                    else:
+                        sell_price = market.get("no_bid", 0) / 100
+                    
+                    if sell_price > 0.01:
+                        self.logger.warning(f"Selling {pos.qty} {pos.side.value.upper()} @ ${sell_price:.2f}")
+                        
+                        result = await self.kalshi.sell_position(
+                            ticker, pos.side, pos.qty, sell_price
+                        )
+                        
+                        if result.success:
+                            self.logger.warning(f"GUARDIAN SOLD! Order: {result.order_id}")
+                            self.sold_tickers.add(ticker)
+                            del self.guarded_positions[ticker]
+                            actions.append(f"SOLD {ticker} @ ${sell_price:.2f}")
+                        else:
+                            self.logger.error(f"GUARDIAN SELL FAILED: {result.error}")
+                            actions.append(f"SELL FAILED {ticker}: {result.error}")
+                    else:
+                        self.logger.warning(f"No bid available to sell {ticker}")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error selling {ticker}: {e}")
+                    actions.append(f"ERROR {ticker}: {e}")
+        
+        return actions
+
+
+# =============================================================================
 # MAIN BOT ORCHESTRATOR
 # =============================================================================
 
@@ -1073,8 +1997,9 @@ class KalshiLatencyBot:
     Main orchestrator that coordinates all components.
     """
 
-    def __init__(self, config: Optional[Config] = None):
+    def __init__(self, config: Optional[Config] = None, dry_run: bool = False):
         self.config = config or Config()
+        self.dry_run = dry_run
         self.logger = setup_logging(self.config)
 
         # Initialize components
@@ -1088,11 +2013,19 @@ class KalshiLatencyBot:
         self.signal_gen = SignalGenerator(
             self.config, self.logger, self.price_feed, self.prob_engine
         )
+        
+        # Position guardian for auto-exit protection
+        self.guardian = PositionGuardian(
+            self.config, self.logger, self.kalshi, self.price_feed
+        )
 
         # Register price callback for volatility updates
         self.price_feed.register_callback(self._on_price_update)
 
         self._running = False
+        self._guardian_check_counter = 0
+        self._insufficient_balance_count = 0  # Track consecutive balance failures
+        self._last_trade_error = None
 
     def _on_price_update(self, update: PriceUpdate):
         """Handle incoming price updates"""
@@ -1115,6 +2048,10 @@ class KalshiLatencyBot:
         # Wait for price feeds to populate
         self.logger.info("Waiting for price feeds...")
         await asyncio.sleep(3)
+        
+        # Load positions for guardian auto-exit protection
+        self.logger.info("Loading positions for guardian...")
+        await self.guardian.load_positions()
 
         # Main trading loop
         try:
@@ -1155,18 +2092,57 @@ class KalshiLatencyBot:
 
                 if signals:
                     self.logger.info(f"Generated {len(signals)} signals")
-
-                    # Execute best signal
+                    
+                    # Show the best signal details periodically
                     best_signal = signals[0]
-                    if best_signal.edge >= self.config.MIN_EDGE_THRESHOLD:
-                        await self.execution.execute_signal(best_signal)
+                    import random
+                    if random.random() < 0.20:  # ~20% of cycles, show details
+                        self.logger.info(
+                            f"BEST: {best_signal.market.ticker} {best_signal.side.value.upper()} | "
+                            f"Edge: {best_signal.edge:.1%} | Conf: {best_signal.confidence:.1%} | "
+                            f"Fair: {best_signal.fair_value:.1%} vs Mkt: ${best_signal.market_price:.2f} | "
+                            f"Size: {best_signal.recommended_size}"
+                        )
 
-                # Rate limit: check every 500ms for latency-sensitive trading
-                await asyncio.sleep(0.5)
+                    # Execute best signal (unless in dry-run mode or no balance)
+                    if best_signal.edge >= self.config.MIN_EDGE_THRESHOLD:
+                        # Skip if we've had too many balance failures (likely no cash)
+                        if self._insufficient_balance_count >= 3:
+                            if self._guardian_check_counter == 0:  # Log occasionally
+                                self.logger.info(f"Skipping trade - insufficient balance (protecting positions)")
+                        elif self.dry_run:
+                            self.logger.info(f"[DRY RUN] Would execute: {best_signal}")
+                        else:
+                            self.logger.info(f"TRADE TRIGGER: Edge {best_signal.edge:.1%} >= threshold {self.config.MIN_EDGE_THRESHOLD:.1%}")
+                            result = await self.execution.execute_signal(best_signal)
+                            if result:
+                                self.logger.info(f"EXECUTION RESULT: {result}")
+                                # Track balance failures
+                                if not result.success and "insufficient_balance" in str(result.error):
+                                    self._insufficient_balance_count += 1
+                                else:
+                                    self._insufficient_balance_count = 0
+
+                # GUARDIAN: Check for auto-exit triggers every 4 loops (~4 seconds)
+                self._guardian_check_counter += 1
+                if self._guardian_check_counter >= 4:
+                    self._guardian_check_counter = 0
+                    actions = await self.guardian.check_and_protect()
+                    # Reload positions periodically (every ~60 seconds)
+                    if len(self.guardian.guarded_positions) == 0:
+                        await self.guardian.load_positions()
+
+                # Rate limit: check every 2 seconds to avoid API rate limits
+                await asyncio.sleep(2.0)
 
             except Exception as e:
                 self.logger.error(f"Loop error: {e}")
-                await asyncio.sleep(1)
+                # Check if it's a rate limit error (403)
+                if "403" in str(e) or "blocked" in str(e).lower():
+                    self.logger.warning("Rate limit detected - backing off for 60 seconds")
+                    await asyncio.sleep(60)
+                else:
+                    await asyncio.sleep(10)  # Longer backoff on errors
 
     def run(self):
         """Synchronous entry point"""
@@ -1219,11 +2195,10 @@ def main():
     config.LOG_LEVEL = args.log_level
 
     if args.dry_run:
-        config.KALSHI_API_KEY = ""  # Disable trading
-        print("Running in DRY RUN mode - no trades will be executed")
+        print("Running in DRY RUN mode - signals will be generated but no trades executed")
 
     # Run bot
-    bot = KalshiLatencyBot(config)
+    bot = KalshiLatencyBot(config, dry_run=args.dry_run)
     bot.run()
 
 if __name__ == "__main__":

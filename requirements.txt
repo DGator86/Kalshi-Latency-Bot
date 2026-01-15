@@ -9,6 +9,9 @@ websockets>=12.0
 numpy>=1.24.0
 scipy>=1.11.0
 
+# Cryptography for Kalshi API RSA-PSS authentication
+cryptography>=41.0.0
+
 # Optional: Enhanced logging
 # python-json-logger>=2.0.0
 
