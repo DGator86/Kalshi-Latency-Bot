@@ -935,30 +935,36 @@ class KalshiClient:
         path = f"/markets?ticker={ticker_prefix}&status=open&limit=100"
         headers = self._get_auth_headers("GET", path)
 
-        async with self._session.get(
-            f"{self.config.KALSHI_API_BASE}{path}",
-            headers=headers
-        ) as resp:
-            if resp.status == 403:
-                self.logger.warning("Rate limited by Kalshi - waiting 30 seconds")
-                await asyncio.sleep(30)
-                return []
-            if resp.status != 200:
-                self.logger.error(f"Failed to get markets (status {resp.status})")
-                return []
+        try:
+            async with self._session.get(
+                f"{self.config.KALSHI_API_BASE}{path}",
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as resp:
+                # Check for rate limiting (CloudFront 403)
+                if resp.status == 403 or "text/html" in resp.content_type:
+                    self.logger.warning(f"Rate limited by Kalshi/CloudFront (status {resp.status}) - waiting 60 seconds")
+                    await asyncio.sleep(60)
+                    return []
+                if resp.status != 200:
+                    self.logger.warning(f"Failed to get markets (status {resp.status})")
+                    return []
 
-            data = await resp.json()
-            markets = []
+                data = await resp.json()
+                
+                markets = []
+                for m in data.get("markets", []):
+                    try:
+                        market = self._parse_market(m)
+                        if market:
+                            markets.append(market)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to parse market: {e}")
 
-            for m in data.get("markets", []):
-                try:
-                    market = self._parse_market(m)
-                    if market:
-                        markets.append(market)
-                except Exception as e:
-                    self.logger.warning(f"Failed to parse market: {e}")
-
-            return markets
+                return markets
+        except Exception as e:
+            self.logger.error(f"Error fetching markets: {e}")
+            return []
     
     def _parse_market(self, m: dict) -> Optional[KalshiMarket]:
         """Parse a market from API response"""
