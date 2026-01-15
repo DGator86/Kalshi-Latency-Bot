@@ -1,0 +1,32 @@
+{
+  "kalshi": {
+    "api_base": "https://trading-api.kalshi.com",
+    "api_key": "your_api_key_here",
+    "api_secret": "your_api_secret_here"
+  },
+  "trading": {
+    "edge_threshold": 0.03,
+    "kelly_fraction": 0.25,
+    "max_daily_loss": 1000,
+    "max_position_size": 100,
+    "target_markets": ["BTC", "ETH"]
+  },
+  "exchanges": {
+    "binance": {
+      "enabled": true,
+      "ws_url": "wss://stream.binance.com:9443/ws"
+    },
+    "coinbase": {
+      "enabled": true,
+      "ws_url": "wss://ws-feed.exchange.coinbase.com"
+    },
+    "kraken": {
+      "enabled": true,
+      "ws_url": "wss://ws.kraken.com"
+    }
+  },
+  "monitoring": {
+    "dashboard_port": 8080,
+    "log_level": "INFO"
+  }
+}
